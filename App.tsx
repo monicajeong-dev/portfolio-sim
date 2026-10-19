@@ -319,15 +319,26 @@ export default function App() {
   const r = simulate(s)
   const pct = r.need > 0 ? (r.assetReal / r.need) * 100 : 0
   const ok = r.gap <= 0
+  // 보유 종목의 현재 평가금액과 매입원금
   const stockVal = s.holdings.reduce((t, h) => t + hv(h), 0)
   const stockPrin = s.holdings.reduce((t, h) => t + hp(h), 0)
+
+  // 예금·적금 잔액
   const cashTotal = s.cash.reduce((t, c) => t + c.bal, 0)
-  const totalBal = s.accs.reduce((t, a) => t + a.bal, 0) + stockVal + cashTotal
-  const totalPrin = s.accs.reduce((t, a) => t + a.principal, 0) + stockPrin + cashTotal
+
+  // 예금·적금을 제외한 투자자산과 투자원금
+  const investmentBal = s.accs.reduce((t, a) => t + a.bal, 0) + stockVal
+  const investmentPrin = s.accs.reduce((t, a) => t + a.principal, 0) + stockPrin
+
+  // 총자산 = 투자자산 + 현금성 자산
+  const totalBal = investmentBal + cashTotal
+  const totalPrin = investmentPrin + cashTotal
   const totalPmt = s.accs.reduce((t, a) => t + a.pmt, 0) + s.cash.reduce((t, c) => t + c.pmt, 0)
   const totalDebt = s.loans.reduce((t, l) => t + l.bal, 0)
   const totalPay = s.loans.reduce((t, l) => t + l.pay, 0)
-  const profit = totalBal - totalPrin
+
+  // 투자 평가손익은 투자자산에 대해서만 계산
+  const profit = investmentBal - investmentPrin
 
   const byAcc = [...s.accs.map((a, i) => ({ label: a.name, value: a.bal + accStock(i) })), { label: '예·적금', value: cashTotal }]
   const byItem = [
@@ -598,16 +609,52 @@ export default function App() {
           <section className="card">
             <h2>현재 현황</h2>
             <dl className="stats">
-              <div><dt>총 평가금액</dt><dd>{won(totalBal)}</dd></div>
-              <div><dt>총 투자원금</dt><dd>{won(totalPrin)}</dd></div>
-              <div><dt>보유 종목 평가금액</dt><dd>{won(stockVal)}</dd></div>
-              <div><dt>현금성 자산</dt><dd>{won(cashTotal)}</dd></div>
-              <div><dt>평가손익</dt><dd className={profit >= 0 ? 'up' : 'down'}>{profit >= 0 ? '+' : ''}{won(profit)}</dd></div>
-              <div><dt>총 부채 ({s.loans.length}건)</dt><dd>{won(totalDebt)}</dd></div>
-              <div><dt>순자산</dt><dd>{won(totalBal - totalDebt)}</dd></div>
-              <div><dt>월 총 납입</dt><dd>{won(totalPmt)}</dd></div>
-              <div><dt>월 총 상환</dt><dd>{won(totalPay)}</dd></div>
-              <div><dt>연 세액공제 환급 예상</dt><dd>{won(r.credit.refund)}</dd></div>
+              <div>
+                <dt>총자산 (투자자산 + 현금성 자산)</dt>
+                <dd>{won(totalBal)}</dd>
+              </div>
+              <div>
+                <dt>투자자산 평가금액 (예·적금 제외)</dt>
+                <dd>{won(investmentBal)}</dd>
+              </div>
+              <div>
+                <dt>투자원금 (예·적금 제외)</dt>
+                <dd>{won(investmentPrin)}</dd>
+              </div>
+              <div>
+                <dt>보유 종목 평가금액</dt>
+                <dd>{won(stockVal)}</dd>
+              </div>
+              <div>
+                <dt>현금성 자산 (예금·적금)</dt>
+                <dd>{won(cashTotal)}</dd>
+              </div>
+              <div>
+                <dt>투자 평가손익</dt>
+                <dd className={profit >= 0 ? 'up' : 'down'}>
+                  {profit >= 0 ? '+' : ''}{won(profit)}
+                </dd>
+              </div>
+              <div>
+                <dt>총부채 ({s.loans.length}건)</dt>
+                <dd>{won(totalDebt)}</dd>
+              </div>
+              <div>
+                <dt>순자산 (총자산 - 총부채)</dt>
+                <dd>{won(totalBal - totalDebt)}</dd>
+              </div>
+              <div>
+                <dt>월 총 납입</dt>
+                <dd>{won(totalPmt)}</dd>
+              </div>
+              <div>
+                <dt>월 총 상환</dt>
+                <dd>{won(totalPay)}</dd>
+              </div>
+              <div>
+                <dt>연 세액공제 환급 예상</dt>
+                <dd>{won(r.credit.refund)}</dd>
+              </div>
             </dl>
           </section>
         </aside>
