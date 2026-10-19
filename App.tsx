@@ -5,6 +5,7 @@ type Acc = { name: string; note: string; bal: number; principal: number; pmt: nu
 type Loan = { id: number; name: string; bal: number; rate: number; pay: number }
 type Holding = { id: number; name: string; acc: number; qty: number; avg: number; price: number; ret?: number; vol?: number }
 type Cash = { id: number; name: string; bal: number; pmt: number; rate: number }
+type Property = { id: number; name: string; value: number; note: string }
 type S = {
   stockPct: number; bondPct: number; cashPct: number;
   age: number; retireAge: number; endAge: number
@@ -13,6 +14,7 @@ type S = {
   loans: Loan[]
   holdings: Holding[]
   cash: Cash[]
+  properties: Property[]
   accs: Acc[]
 }
 
@@ -22,7 +24,7 @@ const DEFAULT: S = {
   age: 40, retireAge: 55, endAge: 90,
   monthly: 0, keep: 0, inflation: 3, wRet: 4,
   salary: 0, reinvest: true,
-  loans: [], holdings: [], cash: [],
+  loans: [], holdings: [], cash: [], properties: [],
   accs: [
     { name: 'CMA', note: '비상금·대기자금', bal: 0, principal: 0, pmt: 0, ret: 2 },
     { name: 'ISA', note: '중기 절세 투자', bal: 0, principal: 0, pmt: 0, ret: 5 },
@@ -53,7 +55,9 @@ const fmt = (v: number) => {
 function load(): S {
   try {
     const r = localStorage.getItem('sim-v3') // 초기 금액 0원 기본값 버전
-    return r ? { ...DEFAULT, ...JSON.parse(r), stockPct: JSON.parse(r).stockPct ?? 60, bondPct: JSON.parse(r).bondPct ?? 30, cashPct: JSON.parse(r).cashPct ?? 10 } : DEFAULT
+    if (!r) return DEFAULT
+    const parsed = JSON.parse(r)
+    return { ...DEFAULT, ...parsed, properties: Array.isArray(parsed.properties) ? parsed.properties : [], stockPct: parsed.stockPct ?? 60, bondPct: parsed.bondPct ?? 30, cashPct: parsed.cashPct ?? 10 }
   } catch { return DEFAULT }
 }
 
@@ -314,6 +318,11 @@ export default function App() {
   const addCash = () =>
     setS(o => ({ ...o, cash: [...o.cash, { id: Date.now(), name: `예·적금 ${o.cash.length + 1}`, bal: 0, pmt: 0, rate: 3 }] }))
   const delCash = (id: number) => setS(o => ({ ...o, cash: o.cash.filter(c => c.id !== id) }))
+  const setProperty = (id: number, k: keyof Property, v: string | number) =>
+    setS(o => ({ ...o, properties: o.properties.map(h => (h.id === id ? { ...h, [k]: v } : h)) }))
+  const addProperty = () =>
+    setS(o => ({ ...o, properties: [...o.properties, { id: Date.now(), name: `부동산 ${o.properties.length + 1}`, value: 0, note: '거주 주택' }] }))
+  const delProperty = (id: number) => setS(o => ({ ...o, properties: o.properties.filter(h => h.id !== id) }))
   const accStock = (i: number) => s.holdings.filter(h => h.acc === i).reduce((t, h) => t + hv(h), 0)
 
   const r = simulate(s)
@@ -330,8 +339,12 @@ export default function App() {
   const investmentBal = s.accs.reduce((t, a) => t + a.bal, 0) + stockVal
   const investmentPrin = s.accs.reduce((t, a) => t + a.principal, 0) + stockPrin
 
-  // 총자산 = 투자자산 + 현금성 자산
+  // 금융자산은 은퇴 시뮬레이션에서 사용할 수 있는 자산으로 계산합니다.
   const totalBal = investmentBal + cashTotal
+  // 부동산은 총자산·순자산에는 포함하지만, 매도/주택연금 등을 별도로 가정하지 않는 한
+  // 은퇴 생활비 시뮬레이션에는 포함하지 않습니다.
+  const propertyTotal = s.properties.reduce((t, p) => t + p.value, 0)
+  const grossAssets = totalBal + propertyTotal
   const totalPrin = investmentPrin + cashTotal
   const totalPmt = s.accs.reduce((t, a) => t + a.pmt, 0) + s.cash.reduce((t, c) => t + c.pmt, 0)
   const totalDebt = s.loans.reduce((t, l) => t + l.bal, 0)
@@ -340,11 +353,12 @@ export default function App() {
   // 투자 평가손익은 투자자산에 대해서만 계산
   const profit = investmentBal - investmentPrin
 
-  const byAcc = [...s.accs.map((a, i) => ({ label: a.name, value: a.bal + accStock(i) })), { label: '예·적금', value: cashTotal }]
+  const byAcc = [...s.accs.map((a, i) => ({ label: a.name, value: a.bal + accStock(i) })), { label: '예·적금', value: cashTotal }, ...s.properties.map(p => ({ label: p.name || '부동산', value: p.value }))]
   const byItem = [
     ...s.holdings.map(h => ({ label: h.name || '종목', value: hv(h) })),
     { label: '종목 외 계좌 잔액', value: s.accs.reduce((t, a) => t + a.bal, 0) },
     { label: '예·적금', value: cashTotal },
+    ...s.properties.map(p => ({ label: p.name || '부동산', value: p.value })),
   ]
   const stale = !!mc && mc.key !== JSON.stringify(s)
   const runMC = () => {
@@ -385,7 +399,7 @@ export default function App() {
       <section className="card backup-tools">
         <h2>백업 및 복원</h2>
         <div className="tool-row"><button className="btn" onClick={exportJSON}>JSON 백업 다운로드</button><label className="btn file-btn">JSON 백업 불러오기<input type="file" accept="application/json,.json" onChange={e => importJSON(e.target.files?.[0])} /></label></div>
-        {importError && <p className="warn">{importError}</p>}<p className="hint">다른 기기에서 이 파일을 불러오면 입력값을 복원할 수 있습니다. 백업 파일에는 금융 정보가 포함될 수 있으니 안전하게 보관하세요.</p>
+        {importError && <p className="warn">{importError}</p>}<p className="hint">다른 기기에서 이 파일을 불러오면 금융자산·부동산·부채 입력값을 복원할 수 있습니다. 백업 파일에는 금융 정보가 포함될 수 있으니 안전하게 보관하세요.</p>
       </section>
       <div className="layout">
         <main className="inputs">
@@ -510,6 +524,25 @@ export default function App() {
           </section>
 
           <section className="card">
+            <h2>부동산 자산 (은퇴 시뮬레이션 제외)</h2>
+            <p className="hint">거주 주택이나 투자용 부동산의 현재 시세를 입력하세요. 총자산·순자산과 자산 비중에는 포함되지만, 매도·주택연금·임대수익을 별도로 설정하지 않는 한 은퇴 생활비 충당 자산에는 포함하지 않습니다. 부동산 관련 대출은 아래 부채에 별도로 등록하세요.</p>
+            {s.properties.length === 0 && <p className="empty">등록된 부동산이 없습니다.</p>}
+            {s.properties.map(p => (
+              <div className="loan" key={p.id}>
+                <div className="loan-head">
+                  <input className="name-input" value={p.name} aria-label="부동산 이름" onChange={e => setProperty(p.id, 'name', e.target.value)} />
+                  <button className="btn-del" onClick={() => delProperty(p.id)}>삭제</button>
+                </div>
+                <div className="grid2">
+                  <Money label="현재 시세" value={p.value} onChange={v => setProperty(p.id, 'value', v)} />
+                  <label className="field"><span>용도 / 메모</span><input value={p.note} onChange={e => setProperty(p.id, 'note', e.target.value)} /></label>
+                </div>
+              </div>
+            ))}
+            <button className="btn" onClick={addProperty}>+ 부동산 추가</button>
+          </section>
+
+          <section className="card">
             <h2>부채</h2>
             {s.loans.length === 0 && <p className="empty">등록된 대출이 없습니다. 대출이 있다면 종류별로 추가하세요.</p>}
             {s.loans.map(l => (
@@ -580,7 +613,7 @@ export default function App() {
           <section className="card">
             <h2>{s.retireAge}세에 필요한 자산 vs 예상 자산</h2>
             <Chart pts={r.series} need={r.need} fan={mc?.fan} />
-            <small className="hint">선은 순자산(자산-부채)을 오늘 가치로 환산한 값입니다.</small>
+            <small className="hint">선은 부동산을 제외한 금융자산에서 등록된 부채를 차감한 금액을 오늘 가치로 환산한 값입니다. 부동산 시세는 은퇴 생활비 시뮬레이션에 포함하지 않습니다.</small>
             <dl className="stats">
               <div><dt>필요 자산 (오늘 가치)</dt><dd>{fmt(r.need)}</dd></div>
               <div><dt>예상 자산 (오늘 가치)</dt><dd>{fmt(r.assetReal)}</dd></div>
@@ -610,8 +643,16 @@ export default function App() {
             <h2>현재 현황</h2>
             <dl className="stats">
               <div>
-                <dt>총자산 (투자자산 + 현금성 자산)</dt>
+                <dt>총 금융자산 (투자자산 + 현금성 자산)</dt>
                 <dd>{won(totalBal)}</dd>
+              </div>
+              <div>
+                <dt>부동산 자산 (현재 시세)</dt>
+                <dd>{won(propertyTotal)}</dd>
+              </div>
+              <div>
+                <dt>총자산 (금융자산 + 부동산)</dt>
+                <dd>{won(grossAssets)}</dd>
               </div>
               <div>
                 <dt>투자자산 평가금액 (예·적금 제외)</dt>
@@ -641,6 +682,10 @@ export default function App() {
               </div>
               <div>
                 <dt>순자산 (총자산 - 총부채)</dt>
+                <dd>{won(grossAssets - totalDebt)}</dd>
+              </div>
+              <div>
+                <dt>금융자산 기준 잔액 (금융자산 - 총부채)</dt>
                 <dd>{won(totalBal - totalDebt)}</dd>
               </div>
               <div>
