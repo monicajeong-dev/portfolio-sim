@@ -365,7 +365,10 @@ export default function App() {
         <p>
           현재 자산과 투자 계획을 바탕으로
           목표 달성에 필요한 방법을 시뮬레이션해 보세요.</p>
-          {s.retireAge}세부터 {s.endAge}세까지, 통장에 매달 세후 {won(s.monthly)}이 찍히려면</p>
+        <p>
+          {s.retireAge}세부터 {s.endAge}세까지,
+          통장에 매달 세후 {won(s.monthly)}이 찍히려면
+        </p>
       </header>
 
       <section className="card backup-tools">
