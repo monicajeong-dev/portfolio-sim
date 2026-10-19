@@ -524,8 +524,8 @@ export default function App() {
           </section>
 
           <section className="card">
-            <h2>부동산 자산 (은퇴 시뮬레이션 제외)</h2>
-            <p className="hint">거주 주택이나 투자용 부동산의 현재 시세를 입력하세요. 총자산·순자산과 자산 비중에는 포함되지만, 매도·주택연금·임대수익을 별도로 설정하지 않는 한 은퇴 생활비 충당 자산에는 포함하지 않습니다. 부동산 관련 대출은 아래 부채에 별도로 등록하세요.</p>
+            <h2>부동산 자산 (현금흐름 시뮬레이션 제외)</h2>
+            <p className="hint">거주 주택이나 투자용 부동산의 현재 시세를 입력하세요. 총자산·순자산과 자산 비중에는 포함되지만, 매도·주택연금·임대수익을 별도로 설정하지 않는 한 현금흐름 충당 자산에는 포함하지 않습니다. 부동산 관련 대출은 아래 부채에 별도로 등록하세요.</p>
             {s.properties.length === 0 && <p className="empty">등록된 부동산이 없습니다.</p>}
             {s.properties.map(p => (
               <div className="loan" key={p.id}>
