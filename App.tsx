@@ -6,6 +6,7 @@ type Loan = { id: number; name: string; bal: number; rate: number; pay: number }
 type Holding = { id: number; name: string; acc: number; qty: number; avg: number; price: number; ret?: number; vol?: number }
 type Cash = { id: number; name: string; bal: number; pmt: number; rate: number }
 type S = {
+  stockPct: number; bondPct: number; cashPct: number;
   age: number; retireAge: number; endAge: number
   monthly: number; keep: number; inflation: number; wRet: number
   salary: number; reinvest: boolean
@@ -17,6 +18,7 @@ type S = {
 
 // 계좌 순서 고정: 0 CMA, 1 ISA, 2 IRP, 3 연금저축, 4 일반
 const DEFAULT: S = {
+  stockPct: 60, bondPct: 30, cashPct: 10,
   age: 40, retireAge: 55, endAge: 90,
   monthly: 0, keep: 0, inflation: 3, wRet: 4,
   salary: 0, reinvest: true,
@@ -51,7 +53,7 @@ const fmt = (v: number) => {
 function load(): S {
   try {
     const r = localStorage.getItem('sim-v3') // 초기 금액 0원 기본값 버전
-    return r ? { ...DEFAULT, ...JSON.parse(r) } : DEFAULT
+    return r ? { ...DEFAULT, ...JSON.parse(r), stockPct: JSON.parse(r).stockPct ?? 60, bondPct: JSON.parse(r).bondPct ?? 30, cashPct: JSON.parse(r).cashPct ?? 10 } : DEFAULT
   } catch { return DEFAULT }
 }
 
@@ -157,22 +159,32 @@ function monteCarlo(s: S, runs = 1000) {
   const weights = s.accs.map(a => Math.max(0, a.bal) + Math.max(0, a.pmt) * 12)
   const vols = s.accs.map((a, i) => a.vol ?? DEF_VOL[i])
   const weightSum = weights.reduce((a, b) => a + b, 0)
-  const portfolioVol = weightSum > 0 ? weights.reduce((sum, w, i) => sum + w * vols[i], 0) / weightSum / 100 : 12 / 100
+  const allocationTotal = Math.max(1, s.stockPct + s.bondPct + s.cashPct)
+  const stockW = s.stockPct / allocationTotal, bondW = s.bondPct / allocationTotal, cashW = s.cashPct / allocationTotal
+  const portfolioVol = Math.sqrt(stockW * stockW * 0.20 * 0.20 + bondW * bondW * 0.06 * 0.06 + cashW * cashW * 0.01 * 0.01 + 2 * stockW * bondW * 0.15 * 0.20 * 0.06)
   let successes = 0
+  const withdrawalCols: number[][] = Array.from({ length: years + 1 }, () => [])
+  let depletionMonths: number[] = []
   finals.forEach(start => {
     let balance = Math.max(0, start)
+    withdrawalCols[0].push(balance)
+    let depletedAt = -1
     let survived = true
     for (let m = 0; m < months; m++) {
       const shock = (portfolioVol / Math.sqrt(12)) * randn()
       balance = Math.max(0, balance * Math.max(0.01, 1 + baseMonthly + shock) - s.monthly)
-      if (balance <= 0 && m < months - 1) { survived = false; break }
+      if (balance <= 0 && depletedAt < 0) { depletedAt = m + 1; survived = false }
+      if ((m + 1) % 12 === 0) withdrawalCols[Math.floor((m + 1) / 12)].push(balance)
     }
+    if (depletedAt >= 0) depletionMonths.push(depletedAt)
     if (survived && balance >= s.keep) successes++
   })
   return {
     rate: successes / runs,
     p10: q(finals, 0.1), p50: q(finals, 0.5), p90: q(finals, 0.9),
     fan: ages.map((age, j) => ({ age, lo: q(cols[j], 0.1), hi: q(cols[j], 0.9) })),
+    withdrawalFan: withdrawalCols.map((vals, year) => ({ age: s.retireAge + year, lo: vals.length ? q(vals, 0.1) : 0, mid: vals.length ? q(vals, 0.5) : 0, hi: vals.length ? q(vals, 0.9) : 0 })),
+    depletionAge: depletionMonths.length ? s.retireAge + Math.min(...depletionMonths) / 12 : null,
   }
 }
 
@@ -266,11 +278,22 @@ function Donut({ data }: { data: { label: string; value: number }[] }) {
   )
 }
 
+
+function WithdrawalChart({ rows }: { rows: { age: number; lo: number; mid: number; hi: number }[] }) {
+  if (!rows.length) return <p className="empty">확률 계산을 실행하면 인출기 경로가 표시됩니다.</p>
+  const W=640,H=220,pad=42,max=Math.max(1,...rows.map(r=>r.hi));
+  const x=(i:number)=>pad+(rows.length<2?0:i*(W-pad*2)/(rows.length-1));
+  const y=(v:number)=>H-pad-Math.max(0,v)/max*(H-pad*2);
+  const line=(key:'lo'|'mid'|'hi')=>rows.map((r,i)=>`${i?'L':'M'}${x(i)},${y(r[key])}`).join(' ');
+  return <svg viewBox={`0 0 ${W} ${H}`} className="chart" role="img" aria-label="은퇴 후 자산 잔액 확률 경로"><path d={line('hi')} className="band-line"/><path d={line('mid')} className="line"/><path d={line('lo')} className="need-line"/><text className="lbl" x={pad} y={H-10}>{rows[0].age}세</text><text className="lbl" x={W-pad} y={H-10} textAnchor="end">{rows[rows.length-1].age}세</text></svg>
+}
+
 export default function App() {
   const [s, setS] = useState<S>(load)
   const [mc, setMc] = useState<(ReturnType<typeof monteCarlo> & { key: string }) | null>(null)
   const [busy, setBusy] = useState(false)
   const [view, setView] = useState<'acc' | 'item'>('acc')
+  const [importError, setImportError] = useState('')
   useEffect(() => { try { localStorage.setItem('sim-v3', JSON.stringify(s)) } catch { /* 저장 실패는 무시 */ } }, [s])
 
   const set = <K extends keyof S>(k: K, v: S[K]) => setS(o => ({ ...o, [k]: v }))
@@ -319,6 +342,21 @@ export default function App() {
     setTimeout(() => { setMc({ ...monteCarlo(s), key }); setBusy(false) }, 30)
   }
 
+  const exportJSON = () => {
+    const blob = new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'portfolio-sim-backup.json'; a.click(); URL.revokeObjectURL(url);
+  }
+  const importJSON = async (file?: File) => {
+    if (!file) return;
+    try { const parsed = JSON.parse(await file.text()); if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.accs)) throw new Error('형식이 올바르지 않습니다.'); setS({ ...DEFAULT, ...parsed }); setMc(null); setImportError(''); } catch { setImportError('JSON 파일을 읽지 못했습니다. 이 시뮬레이터에서 내보낸 백업 파일인지 확인해 주세요.'); }
+  }
+  const allocTotal = Math.max(1, s.stockPct + s.bondPct + s.cashPct)
+  const allocReturn = (s.stockPct * 7 + s.bondPct * 3.5 + s.cashPct * 2) / allocTotal
+  const scenarioSpend = (extraPmt: number, retireAge: number) => simulate({ ...s, accs: s.accs.map((a, i) => i === 1 ? { ...a, pmt: a.pmt + extraPmt } : a), retireAge }).gap
+  const extraNeeded = (() => { if (ok) return 0; let lo=0,hi=100000; while(hi<100000000 && scenarioSpend(hi,s.retireAge)>0) hi*=2; for(let i=0;i<28;i++){const mid=(lo+hi)/2;if(scenarioSpend(mid,s.retireAge)<=0)hi=mid;else lo=mid;} return Math.ceil(hi/10000)*10000 })()
+  const delayedAge = (() => { for(let a=Math.max(s.retireAge+1,s.age+1);a<=Math.min(85,s.endAge-1);a++){if(simulate({ ...s, retireAge:a }).gap<=0)return a;} return null })()
+  const reducedMonthly = (() => { let lo=0,hi=s.monthly; for(let i=0;i<24;i++){const mid=(lo+hi)/2;if(simulate({ ...s, monthly:mid }).gap<=0)lo=mid;else hi=mid;} return Math.floor(lo/10000)*10000 })()
+
   return (
     <div className="page">
       <header className="top">
@@ -326,6 +364,11 @@ export default function App() {
         <p>{s.retireAge}세부터 {s.endAge}세까지, 통장에 매달 세후 {won(s.monthly)}이 찍히려면</p>
       </header>
 
+      <section className="card backup-tools">
+        <h2>백업 및 복원</h2>
+        <div className="tool-row"><button className="btn" onClick={exportJSON}>JSON 백업 다운로드</button><label className="btn file-btn">JSON 백업 불러오기<input type="file" accept="application/json,.json" onChange={e => importJSON(e.target.files?.[0])} /></label></div>
+        {importError && <p className="warn">{importError}</p>}<p className="hint">다른 기기에서 이 파일을 불러오면 입력값을 복원할 수 있습니다. 백업 파일에는 금융 정보가 포함될 수 있으니 안전하게 보관하세요.</p>
+      </section>
       <div className="layout">
         <main className="inputs">
           <section className="card">
@@ -348,6 +391,17 @@ export default function App() {
               <Rng label="인출기 수익률" value={s.wRet} min={0} max={8} step={0.5} unit="%" onChange={v => set('wRet', v)} />
             </div>
             <p className="hint">적립기 수익률은 아래 계좌별로 입력합니다. 물가가 높고 수익률이 낮을수록 필요 자산이 커집니다.</p>
+          </section>
+
+          <section className="card">
+            <h2>자산 배분 시뮬레이션</h2>
+            <p className="hint">비중을 조절하면 인출기 확률 계산의 예상 변동성이 달라집니다. 비중은 자동으로 100% 정규화해 계산합니다.</p>
+            <div className="grid3">
+              <Rng label="주식" value={s.stockPct} min={0} max={100} step={5} unit="%" onChange={v => set('stockPct',v)} />
+              <Rng label="채권" value={s.bondPct} min={0} max={100} step={5} unit="%" onChange={v => set('bondPct',v)} />
+              <Rng label="현금" value={s.cashPct} min={0} max={100} step={5} unit="%" onChange={v => set('cashPct',v)} />
+            </div>
+            <p className="sum-line">입력 비중 {s.stockPct+s.bondPct+s.cashPct}% · 가중 기대수익률 예시 <b>{allocReturn.toFixed(2)}%</b> · 예상 변동성 <b>{(Math.sqrt(Math.pow(s.stockPct/allocTotal*.20,2)+Math.pow(s.bondPct/allocTotal*.06,2)+Math.pow(s.cashPct/allocTotal*.01,2))*100).toFixed(1)}%</b></p>
           </section>
 
           <section className="card">
@@ -479,6 +533,15 @@ export default function App() {
           )}
 
           <section className="card">
+            <h2>목표 부족 해결 시나리오</h2>
+            {ok ? <p className="sum-line">현재 입력 기준으로 목표 자산을 충족합니다. 납입액이나 배분을 바꿔 여유도를 확인해 보세요.</p> : <div className="scenario-list">
+              <div><span>① 월 납입액 늘리기</span><b>월 {won(extraNeeded)} 추가</b><small>현재 ISA 월 납입액에 추가하는 금액으로 계산한 근사치입니다.</small></div>
+              <div><span>② 인출 시작 늦추기</span><b>{delayedAge === null ? '목표 달성 불가' : `${delayedAge}세부터 인출`}</b><small>{delayedAge === null ? '현재 종료 나이까지 연기해도 부족할 수 있습니다.' : `현재보다 ${delayedAge-s.retireAge}년 늦춥니다.`}</small></div>
+              <div><span>③ 월 목표 생활비 줄이기</span><b>월 {won(reducedMonthly)} 이하</b><small>오늘 가치 기준 월 인출 목표의 근사치입니다.</small></div>
+            </div>}
+          </section>
+
+          <section className="card">
             <h2>성공 확률 (몬테카를로)</h2>
             <p className="hint" style={{ marginTop: 0 }}>적립기와 인출기 모두 시장 변동을 반영한 1,000개 경로를 계산합니다. 인출 기간 동안 자산이 고갈되지 않고 목표 잔존금액을 지키는 비율입니다.</p>
             {mc && (
@@ -506,6 +569,14 @@ export default function App() {
               <div><dt>예상 자산 (미래 금액)</dt><dd>{fmt(r.assetNom)}</dd></div>
               <div><dt>인출 시점 남은 대출</dt><dd>{fmt(r.debtLeft)}</dd></div>
             </dl>
+          </section>
+
+          <section className="card">
+            <h2>인출기 자산 고갈 경로</h2>
+            {mc && <p className="sum-line">예상 자산 고갈 시점: <b>{mc.depletionAge === null ? '시뮬레이션 경로에서 고갈 없음' : `${mc.depletionAge.toFixed(1)}세 전후`}</b></p>}
+            <WithdrawalChart rows={mc?.withdrawalFan ?? []} />
+            {mc && <div className="legend-text"><span>위쪽 선: 상위 10%</span><span>가운데 선: 중앙값</span><span>아래쪽 선: 하위 10%</span></div>}
+            <p className="hint">인출기 경로는 현재 가정과 단순화된 월별 무작위 수익률에 따른 예시이며 미래를 예측하거나 보장하지 않습니다.</p>
           </section>
 
           <section className="card">
