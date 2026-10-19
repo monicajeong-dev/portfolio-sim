@@ -360,15 +360,15 @@ export default function App() {
   return (
     <div className="page">
       <header className="top">
-        <h1>캐시플로우 플래</h1>
-        <p>내가 원하는 나이에, 원하는 현금흐름을.</p>
-        <p>
-          현재 자산과 투자 계획을 바탕으로
-          목표 달성에 필요한 방법을 시뮬레이션해 보세요.</p>
+        <h1>캐시플로우 플래너</h1>
         <p>
           {s.retireAge}세부터 {s.endAge}세까지,
           통장에 매달 세후 {won(s.monthly)}이 찍히려면
         </p>
+        <p>
+          현재 자산과 투자 계획을 바탕으로
+          목표 달성에 필요한 방법을 시뮬레이션해 보세요.</p>
+        
       </header>
 
       <section className="card backup-tools">
