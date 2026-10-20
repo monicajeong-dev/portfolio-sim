@@ -1,357 +1,82 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { DEFAULT, TAX, boost, check, fmt, hp, hv, moveValue, sanitize, simulate, solve, wRetOf, won, type S } from './engine'
+import { Card, Donut, LifeChart, Money, Num, Rng } from './ui'
 
-// 모든 금액 단위: 원 (1원까지 입력)
-type Acc = { name: string; note: string; bal: number; principal: number; pmt: number; ret: number; vol?: number }
-type Loan = { id: number; name: string; bal: number; rate: number; pay: number }
-type Holding = { id: number; name: string; acc: number; qty: number; avg: number; price: number; ret?: number; vol?: number }
-type Cash = { id: number; name: string; bal: number; pmt: number; rate: number }
-type Property = { id: number; name: string; value: number; note: string }
-type S = {
-  stockPct: number; bondPct: number; cashPct: number;
-  age: number; retireAge: number; endAge: number
-  monthly: number; keep: number; inflation: number; wRet: number
-  salary: number; reinvest: boolean
-  loans: Loan[]
-  holdings: Holding[]
-  cash: Cash[]
-  properties: Property[]
-  accs: Acc[]
-}
-
-// 계좌 순서 고정: 0 CMA, 1 ISA, 2 IRP, 3 연금저축, 4 일반
-const DEFAULT: S = {
-  stockPct: 60, bondPct: 30, cashPct: 10,
-  age: 40, retireAge: 55, endAge: 90,
-  monthly: 0, keep: 0, inflation: 3, wRet: 4,
-  salary: 0, reinvest: true,
-  loans: [], holdings: [], cash: [], properties: [],
-  accs: [
-    { name: 'CMA', note: '비상금·대기자금', bal: 0, principal: 0, pmt: 0, ret: 2 },
-    { name: 'ISA', note: '중기 절세 투자', bal: 0, principal: 0, pmt: 0, ret: 5 },
-    { name: 'IRP', note: '세액공제·노후', bal: 0, principal: 0, pmt: 0, ret: 5 },
-    { name: '연금저축', note: '세액공제·노후', bal: 0, principal: 0, pmt: 0, ret: 5 },
-    { name: '일반 투자', note: '주식·ETF 등', bal: 0, principal: 0, pmt: 0, ret: 7 },
-  ],
-}
-
-// 세금 가정 (세법 개정 시 여기만 수정)
-const TAX = {
-  deposit: 0.154, isaExempt: 2_000_000, isaRate: 0.099, pension: 0.055,
-  creditPension: 6_000_000, creditTotal: 9_000_000, salaryLine: 55_000_000, creditLow: 0.165, creditHigh: 0.132,
-}
-const DEF_VOL = [0.5, 12, 10, 10, 15] // 계좌별 기본 변동성(%): CMA, ISA, IRP, 연금저축, 일반
-const COL = ['#0d7c8f', '#c0561b', '#3b5bdb', '#1b8a5a', '#9c36b5', '#d4a017', '#e03e6b', '#5f6b7a']
-
-const hv = (h: Holding) => h.qty * h.price // 종목 평가금액
-const hp = (h: Holding) => h.qty * h.avg // 종목 투자원금
-const won = (v: number) => `${Math.round(v).toLocaleString()}원`
-const fmt = (v: number) => {
-  const a = Math.abs(v), s = v < 0 ? '-' : ''
-  if (a >= 1e8) return `${s}${(a / 1e8).toFixed(2)}억원`
-  if (a >= 1e4) return `${s}${Math.round(a / 1e4).toLocaleString()}만원`
-  return `${s}${Math.round(a).toLocaleString()}원`
-}
+type ListKey = 'loans' | 'holdings' | 'cash' | 'properties' | 'incomes'
+const KEY = 'sim-v4'
+const CONS = { dRet: -1.5, crash: 0 }      // 보수: 모든 수익률 -1.5%p
+const CRISIS = { dRet: -1.5, crash: 0.25 } // 위기: 보수 + 은퇴 직후 자산 -25%
 
 function load(): S {
   try {
-    const r = localStorage.getItem('sim-v3') // 초기 금액 0원 기본값 버전
-    if (!r) return DEFAULT
-    const parsed = JSON.parse(r)
-    return { ...DEFAULT, ...parsed, properties: Array.isArray(parsed.properties) ? parsed.properties : [], stockPct: parsed.stockPct ?? 60, bondPct: parsed.bondPct ?? 30, cashPct: parsed.cashPct ?? 10 }
+    const raw = localStorage.getItem(KEY) ?? localStorage.getItem('sim-v3') // 이전 버전 데이터도 안전하게 불러옴
+    return raw ? sanitize(JSON.parse(raw)) : DEFAULT
   } catch { return DEFAULT }
-}
-
-function randn() {
-  let u = 0, v = 0
-  while (!u) u = Math.random()
-  while (!v) v = Math.random()
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v)
-}
-
-// 연금저축·IRP 세액공제 환급 (연)
-function credit(s: S) {
-  const pen = Math.min(s.accs[3].pmt * 12, TAX.creditPension)
-  const base = Math.min(pen + s.accs[2].pmt * 12, TAX.creditTotal)
-  const rate = s.salary <= TAX.salaryLine ? TAX.creditLow : TAX.creditHigh
-  return { refund: base * rate, base, room: TAX.creditTotal - base, rate }
-}
-
-const kindOf = (i: number) => (i === 1 ? 1 : i === 2 || i === 3 ? 2 : 0) // 0 과세, 1 ISA, 2 연금
-
-// stoch=true면 매달 시장 충격을 무작위로 넣습니다(몬테카를로 1회)
-function simulate(s: S, stoch = false) {
-  const years = Math.max(0, s.retireAge - s.age), months = years * 12
-  const infl = s.inflation / 100
-  const items = [
-    ...s.accs.map((a, i) => ({ kind: kindOf(i), bal: a.bal, pr: a.principal, pmt: a.pmt, ret: a.ret, vol: a.vol ?? DEF_VOL[i] })),
-    ...s.holdings.map(h => ({ kind: kindOf(h.acc), bal: hv(h), pr: hp(h), pmt: 0, ret: h.ret ?? s.accs[h.acc].ret, vol: h.vol ?? 18 })),
-    ...s.cash.map(c => ({ kind: 0, bal: c.bal, pr: c.bal, pmt: c.pmt, ret: c.rate, vol: 0 })),
-  ]
-  // 과세 항목은 수익에 15.4%를 매년 반영 (단순화)
-  const rm = items.map(x => Math.pow(1 + (x.ret / 100) * (x.kind === 0 ? 1 - TAX.deposit : 1), 1 / 12) - 1)
-  const b = items.map(x => x.bal), pr = items.map(x => x.pr)
-  const d = s.loans.map(l => l.bal)
-  const debt = () => d.reduce((t, v) => t + v, 0)
-  const cr = credit(s)
-
-  // 세후 가치: ISA는 계좌 전체를 합쳐 한 번만 비과세·분리과세, 연금계좌는 연금소득세 차감
-  const net = () => {
-    let sum = 0, isaB = 0, isaP = 0
-    b.forEach((v, i) => {
-      const k = items[i].kind
-      if (k === 2) sum += v * (1 - TAX.pension)
-      else if (k === 1) { isaB += v; isaP += pr[i] }
-      else sum += v
-    })
-    return sum + isaB - Math.max(0, isaB - isaP - TAX.isaExempt) * TAX.isaRate
-  }
-
-  const series = [{ age: s.age, v: net() - debt() }]
-  for (let m = 1; m <= months; m++) {
-    const zm = stoch ? randn() : 0
-    items.forEach((x, i) => {
-      let g = 1 + rm[i]
-      if (stoch && x.vol > 0) g = Math.max(0.01, g + (x.vol / 100 / Math.sqrt(12)) * (0.7 * zm + 0.714 * randn()))
-      b[i] = (b[i] + x.pmt) * g
-      pr[i] += x.pmt
-    })
-    s.loans.forEach((l, i) => { d[i] = Math.max(0, d[i] * (1 + l.rate / 1200) - l.pay) })
-    if (m % 12 === 0) {
-      if (s.reinvest) b[3] += cr.refund // 세액공제 환급금을 연금저축에 재투자
-      series.push({ age: s.age + m / 12, v: (net() - debt()) / Math.pow(1 + infl, m / 12) })
-    }
-  }
-
-  const f = Math.pow(1 + infl, years)
-  const debtLeft = debt()
-  const assetNom = net() - debtLeft
-  const assetReal = assetNom / f
-
-  // 인출 단계: 오늘 가치 기준 필요 자산 = 월 인출의 현재가치 + 남길 돈의 현재가치
-  const T = Math.max(1, s.endAge - s.retireAge)
-  const rw = (1 + s.wRet / 100) / (1 + infl) - 1
-  const rmw = Math.pow(1 + rw, 1 / 12) - 1
-  const n = T * 12
-  const ann = Math.abs(rmw) < 1e-9 ? n : (1 - Math.pow(1 + rmw, -n)) / rmw
-  const need = s.monthly * ann + s.keep / Math.pow(1 + rw, T)
-
-  const gap = need - assetReal
-  const ra = rm[1]
-  const fac = months === 0 ? 0 : ra === 0 ? months : (Math.pow(1 + ra, months) - 1) / ra
-  const extra = gap > 0 && fac > 0 ? (gap * f) / fac : 0
-  return { years, series, assetNom, assetReal, need, gap, extra, debtLeft, credit: cr }
-}
-
-// 같은 입력으로 미래를 runs번 만들어 성공 비율과 하위10/50/상위90% 경로를 구합니다
-function monteCarlo(s: S, runs = 1000) {
-  const finals: number[] = []
-  const cols: number[][] = []
-  let ages: number[] = []
-  for (let i = 0; i < runs; i++) {
-    const r = simulate(s, true)
-    finals.push(r.assetReal)
-    ages = r.series.map(p => p.age)
-    r.series.forEach((p, j) => { if (!cols[j]) cols[j] = []; cols[j].push(p.v) })
-  }
-  const q = (a: number[], p: number) => [...a].sort((x, y) => x - y)[Math.min(a.length - 1, Math.floor(a.length * p))]
-  // 은퇴 후에도 월별 시장 충격을 적용하며 인출합니다. 잔액이 목표 잔존금액보다
-  // 낮아지면 실패로 판정합니다. 금액은 모두 오늘의 구매력 기준입니다.
-  const years = Math.max(1, s.endAge - s.retireAge)
-  const months = years * 12
-  const realAnnual = (1 + s.wRet / 100) / (1 + s.inflation / 100) - 1
-  const baseMonthly = Math.pow(1 + realAnnual, 1 / 12) - 1
-  const weights = s.accs.map(a => Math.max(0, a.bal) + Math.max(0, a.pmt) * 12)
-  const vols = s.accs.map((a, i) => a.vol ?? DEF_VOL[i])
-  const weightSum = weights.reduce((a, b) => a + b, 0)
-  const allocationTotal = Math.max(1, s.stockPct + s.bondPct + s.cashPct)
-  const stockW = s.stockPct / allocationTotal, bondW = s.bondPct / allocationTotal, cashW = s.cashPct / allocationTotal
-  const portfolioVol = Math.sqrt(stockW * stockW * 0.20 * 0.20 + bondW * bondW * 0.06 * 0.06 + cashW * cashW * 0.01 * 0.01 + 2 * stockW * bondW * 0.15 * 0.20 * 0.06)
-  let successes = 0
-  const withdrawalCols: number[][] = Array.from({ length: years + 1 }, () => [])
-  let depletionMonths: number[] = []
-  finals.forEach(start => {
-    let balance = Math.max(0, start)
-    withdrawalCols[0].push(balance)
-    let depletedAt = -1
-    let survived = true
-    for (let m = 0; m < months; m++) {
-      const shock = (portfolioVol / Math.sqrt(12)) * randn()
-      balance = Math.max(0, balance * Math.max(0.01, 1 + baseMonthly + shock) - s.monthly)
-      if (balance <= 0 && depletedAt < 0) { depletedAt = m + 1; survived = false }
-      if ((m + 1) % 12 === 0) withdrawalCols[Math.floor((m + 1) / 12)].push(balance)
-    }
-    if (depletedAt >= 0) depletionMonths.push(depletedAt)
-    if (survived && balance >= s.keep) successes++
-  })
-  return {
-    rate: successes / runs,
-    p10: q(finals, 0.1), p50: q(finals, 0.5), p90: q(finals, 0.9),
-    fan: ages.map((age, j) => ({ age, lo: q(cols[j], 0.1), hi: q(cols[j], 0.9) })),
-    withdrawalFan: withdrawalCols.map((vals, year) => ({ age: s.retireAge + year, lo: vals.length ? q(vals, 0.1) : 0, mid: vals.length ? q(vals, 0.5) : 0, hi: vals.length ? q(vals, 0.9) : 0 })),
-    depletionAge: depletionMonths.length ? s.retireAge + Math.min(...depletionMonths) / 12 : null,
-  }
-}
-
-// 1원 단위 금액 입력: 숫자만 받고 천 단위 콤마를 자동으로 붙입니다
-function Money(p: { label: string; value: number; onChange: (v: number) => void }) {
-  return (
-    <label className="field">
-      <span>{p.label}</span>
-      <div className="inp">
-        <input
-          inputMode="numeric"
-          placeholder="0"
-          value={p.value ? p.value.toLocaleString() : ''}
-          onChange={e => { const d = e.target.value.replace(/[^\d]/g, ''); p.onChange(d ? Number(d) : 0) }}
-        />
-        <em>원</em>
-      </div>
-      <small className="read">{p.value >= 10000 ? fmt(p.value) : '\u00a0'}</small>
-    </label>
-  )
-}
-
-function Num(p: { label: string; value: number; unit: string; step?: number; onChange: (v: number) => void }) {
-  return (
-    <label className="field">
-      <span>{p.label}</span>
-      <div className="inp">
-        <input type="number" value={p.value} step={p.step ?? 1} onChange={e => p.onChange(Number(e.target.value))} />
-        <em>{p.unit}</em>
-      </div>
-    </label>
-  )
-}
-
-function Rng(p: { label: string; value: number; min: number; max: number; step: number; unit: string; onChange: (v: number) => void }) {
-  return (
-    <label className="field">
-      <span>{p.label} <b>{p.value}{p.unit}</b></span>
-      <input type="range" min={p.min} max={p.max} step={p.step} value={p.value} onChange={e => p.onChange(Number(e.target.value))} />
-    </label>
-  )
-}
-
-function Chart({ pts, need, fan }: { pts: { age: number; v: number }[]; need: number; fan?: { age: number; lo: number; hi: number }[] }) {
-  const W = 640, H = 240, pad = 40
-  const max = Math.max(need, ...pts.map(p => p.v), ...(fan ?? []).map(f => f.hi)) * 1.1 || 1
-  const x = (i: number) => pad + (pts.length < 2 ? 0 : (i * (W - pad * 2)) / (pts.length - 1))
-  const y = (v: number) => H - pad - (Math.max(v, 0) / max) * (H - pad * 2)
-  const path = pts.map((p, i) => `${i ? 'L' : 'M'}${x(i)},${y(p.v)}`).join(' ')
-  const band = fan && fan.length > 1
-    ? fan.map((f, i) => `${i ? 'L' : 'M'}${x(i)},${y(f.hi)}`).join(' ') + ' ' +
-      [...fan].reverse().map((f, i) => `L${x(fan.length - 1 - i)},${y(f.lo)}`).join(' ') + ' Z'
-    : ''
-  const last = pts.length - 1
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="chart" role="img" aria-label="자산 성장 차트">
-      {band && <path d={band} className="band" />}
-      <line className="need" x1={pad} x2={W - pad} y1={y(need)} y2={y(need)} />
-      <text className="lbl" x={W - pad} y={y(need) - 8} textAnchor="end">필요 자산 {fmt(need)}</text>
-      <path d={path} className="line" />
-      <circle cx={x(last)} cy={y(pts[last].v)} r="5" className="dot" />
-      <text className="lbl" x={x(last)} y={y(pts[last].v) + 20} textAnchor="end">{fmt(pts[last].v)}</text>
-      <text className="lbl" x={pad} y={H - 12}>{pts[0].age}세</text>
-      <text className="lbl" x={W - pad} y={H - 12} textAnchor="end">{pts[last].age}세</text>
-    </svg>
-  )
-}
-
-function Donut({ data }: { data: { label: string; value: number }[] }) {
-  const rows = data.filter(d => d.value > 0)
-  const total = rows.reduce((t, d) => t + d.value, 0)
-  if (total <= 0) return <p className="empty">비중을 볼 자산이 없습니다.</p>
-  let cum = 0
-  return (
-    <div className="donut-wrap">
-      <svg viewBox="0 0 42 42" className="donut" role="img" aria-label="자산 비중">
-        <circle cx="21" cy="21" r="15.915" fill="none" stroke="#e6ebf0" strokeWidth="6" />
-        {rows.map((d, i) => {
-          const pc = (d.value / total) * 100
-          const el = <circle key={i} cx="21" cy="21" r="15.915" fill="none" stroke={COL[i % COL.length]} strokeWidth="6" strokeDasharray={`${pc} ${100 - pc}`} strokeDashoffset={25 - cum} />
-          cum += pc
-          return el
-        })}
-      </svg>
-      <ul className="legend">
-        {rows.map((d, i) => (
-          <li key={i}><i style={{ background: COL[i % COL.length] }} /><span>{d.label}</span><b>{((d.value / total) * 100).toFixed(1)}%</b></li>
-        ))}
-      </ul>
-    </div>
-  )
-}
-
-
-function WithdrawalChart({ rows }: { rows: { age: number; lo: number; mid: number; hi: number }[] }) {
-  if (!rows.length) return <p className="empty">확률 계산을 실행하면 인출기 경로가 표시됩니다.</p>
-  const W=640,H=220,pad=42,max=Math.max(1,...rows.map(r=>r.hi));
-  const x=(i:number)=>pad+(rows.length<2?0:i*(W-pad*2)/(rows.length-1));
-  const y=(v:number)=>H-pad-Math.max(0,v)/max*(H-pad*2);
-  const line=(key:'lo'|'mid'|'hi')=>rows.map((r,i)=>`${i?'L':'M'}${x(i)},${y(r[key])}`).join(' ');
-  return <svg viewBox={`0 0 ${W} ${H}`} className="chart" role="img" aria-label="은퇴 후 자산 잔액 확률 경로"><path d={line('hi')} className="band-line"/><path d={line('mid')} className="line"/><path d={line('lo')} className="need-line"/><text className="lbl" x={pad} y={H-10}>{rows[0].age}세</text><text className="lbl" x={W-pad} y={H-10} textAnchor="end">{rows[rows.length-1].age}세</text></svg>
 }
 
 export default function App() {
   const [s, setS] = useState<S>(load)
-  const [mc, setMc] = useState<(ReturnType<typeof monteCarlo> & { key: string }) | null>(null)
-  const [busy, setBusy] = useState(false)
   const [view, setView] = useState<'acc' | 'item'>('acc')
-  const [importError, setImportError] = useState('')
-  useEffect(() => { try { localStorage.setItem('sim-v3', JSON.stringify(s)) } catch { /* 저장 실패는 무시 */ } }, [s])
+  const [step, setStep] = useState(100_000)
+  const [mv, setMv] = useState({ from: 0, to: 0, amt: 0 })
+  const [note, setNote] = useState('')
+  useEffect(() => { try { localStorage.setItem(KEY, JSON.stringify(s)) } catch { /* 저장 실패는 무시 */ } }, [s])
 
   const set = <K extends keyof S>(k: K, v: S[K]) => setS(o => ({ ...o, [k]: v }))
-  const setAcc = (i: number, k: keyof Acc, v: number) =>
+  const setAcc = (i: number, k: 'bal' | 'principal' | 'pmt' | 'ret', v: number) =>
     setS(o => ({ ...o, accs: o.accs.map((a, j) => (j === i ? { ...a, [k]: v } : a)) }))
-  const setLoan = (id: number, k: keyof Loan, v: string | number) =>
-    setS(o => ({ ...o, loans: o.loans.map(l => (l.id === id ? { ...l, [k]: v } : l)) }))
-  const addLoan = () =>
-    setS(o => ({ ...o, loans: [...o.loans, { id: Date.now(), name: `대출 ${o.loans.length + 1}`, bal: 0, rate: 4, pay: 0 }] }))
-  const delLoan = (id: number) => setS(o => ({ ...o, loans: o.loans.filter(l => l.id !== id) }))
-  const setHolding = (id: number, k: keyof Holding, v: string | number) =>
-    setS(o => ({ ...o, holdings: o.holdings.map(h => (h.id === id ? { ...h, [k]: v } : h)) }))
-  const addHolding = () =>
-    setS(o => ({ ...o, holdings: [...o.holdings, { id: Date.now(), name: `종목 ${o.holdings.length + 1}`, acc: 4, qty: 0, avg: 0, price: 0, ret: 5, vol: 18 }] }))
-  const delHolding = (id: number) => setS(o => ({ ...o, holdings: o.holdings.filter(h => h.id !== id) }))
-  const setCash = (id: number, k: keyof Cash, v: string | number) =>
-    setS(o => ({ ...o, cash: o.cash.map(c => (c.id === id ? { ...c, [k]: v } : c)) }))
-  const addCash = () =>
-    setS(o => ({ ...o, cash: [...o.cash, { id: Date.now(), name: `예·적금 ${o.cash.length + 1}`, bal: 0, pmt: 0, rate: 3 }] }))
-  const delCash = (id: number) => setS(o => ({ ...o, cash: o.cash.filter(c => c.id !== id) }))
-  const setProperty = (id: number, k: keyof Property, v: string | number) =>
-    setS(o => ({ ...o, properties: o.properties.map(h => (h.id === id ? { ...h, [k]: v } : h)) }))
-  const addProperty = () =>
-    setS(o => ({ ...o, properties: [...o.properties, { id: Date.now(), name: `부동산 ${o.properties.length + 1}`, value: 0, note: '거주 주택' }] }))
-  const delProperty = (id: number) => setS(o => ({ ...o, properties: o.properties.filter(h => h.id !== id) }))
-  const accStock = (i: number) => s.holdings.filter(h => h.acc === i).reduce((t, h) => t + hv(h), 0)
+  const upd = (k: ListKey, id: number, p: Record<string, string | number | boolean>) =>
+    setS(o => ({ ...o, [k]: (o[k] as { id: number }[]).map(x => (x.id === id ? { ...x, ...p } : x)) }) as S)
+  const add = (k: ListKey, item: object) =>
+    setS(o => ({ ...o, [k]: [...(o[k] as object[]), { id: Math.floor(Date.now() + Math.random() * 1000), ...item }] }) as S)
+  const del = (k: ListKey, id: number) =>
+    setS(o => ({ ...o, [k]: (o[k] as { id: number }[]).filter(x => x.id !== id) }) as S)
 
-  const r = simulate(s)
-  const pct = r.need > 0 ? (r.assetReal / r.need) * 100 : 0
-  const ok = r.gap <= 0
-  // 보유 종목의 현재 평가금액과 매입원금
+  // ---- 계산 (입력이 바뀔 때만 다시 계산) ----
+  const r = useMemo(() => simulate(s), [s])
+  const cons = useMemo(() => simulate(s, CONS), [s])
+  const crisis = useMemo(() => simulate(s, CRISIS), [s])
+  const msgs = useMemo(() => check(s), [s])
+  const sol = useMemo(() => {
+    if (r.gap <= 1) return null
+    const q = solve(s)
+    const rows = [
+      { label: '납입 늘리기', desc: q.A !== null ? `ISA에 월 ${won(q.A)} 더 넣기` : '월 5,000만원을 더 넣어도 어렵습니다', scn: q.sA },
+      { label: '인출 시작 늦추기', desc: q.B !== null ? `${s.retireAge + q.B}세부터 인출 (+${q.B}년)` : `${s.endAge}세 전에는 달성이 어렵습니다`, scn: q.sB },
+      { label: '월 목표 줄이기', desc: q.C !== null ? `월 ${won(q.C)}로 (−${won(s.monthly - q.C)})` : '월 0원으로 줄여도 어렵습니다', scn: q.sC },
+    ]
+    return rows.map(x => ({ ...x, robust: x.scn ? simulate(x.scn, CRISIS).wd.ok : null }))
+  }, [s, r.gap])
+  const rank = useMemo(() => [
+    ...s.accs.map((a, i) => ({ label: `${a.name} 월 납입`, sc: boost(s, 'acc', i, step) })),
+    ...s.holdings.map(h => ({ label: `${h.name || '종목'} 월 매수`, sc: boost(s, 'hold', h.id, step) })),
+  ].map(x => {
+    const d = simulate(x.sc).assetReal - r.assetReal
+    return { label: x.label, d, p: r.need > 0 ? (d / r.need) * 100 : 0 }
+  }).sort((a, b) => b.d - a.d), [s, step, r.assetReal, r.need])
+  const fromId = mv.from || s.holdings[0]?.id || 0
+  const toId = mv.to || s.holdings[1]?.id || 0
+  const sMove = useMemo(() => moveValue(s, fromId, toId, mv.amt), [s, fromId, toId, mv.amt])
+  const rMove = useMemo(() => simulate(sMove), [sMove])
+  const maxD = Math.max(1, ...rank.map(x => x.d))
+
+  // ---- 합계 ----
   const stockVal = s.holdings.reduce((t, h) => t + hv(h), 0)
   const stockPrin = s.holdings.reduce((t, h) => t + hp(h), 0)
-
-  // 예금·적금 잔액
   const cashTotal = s.cash.reduce((t, c) => t + c.bal, 0)
-
-  // 예금·적금을 제외한 투자자산과 투자원금
-  const investmentBal = s.accs.reduce((t, a) => t + a.bal, 0) + stockVal
-  const investmentPrin = s.accs.reduce((t, a) => t + a.principal, 0) + stockPrin
-
-  // 금융자산은 은퇴 시뮬레이션에서 사용할 수 있는 자산으로 계산합니다.
-  const totalBal = investmentBal + cashTotal
-  // 부동산은 총자산·순자산에는 포함하지만, 매도/주택연금 등을 별도로 가정하지 않는 한
-  // 은퇴 생활비 시뮬레이션에는 포함하지 않습니다.
-  const propertyTotal = s.properties.reduce((t, p) => t + p.value, 0)
-  const grossAssets = totalBal + propertyTotal
-  const totalPrin = investmentPrin + cashTotal
-  const totalPmt = s.accs.reduce((t, a) => t + a.pmt, 0) + s.cash.reduce((t, c) => t + c.pmt, 0)
+  const investBal = s.accs.reduce((t, a) => t + a.bal, 0) + stockVal
+  const investPrin = s.accs.reduce((t, a) => t + a.principal, 0) + stockPrin
+  const totalBal = investBal + cashTotal
+  const propTotal = s.properties.reduce((t, p) => t + p.value, 0)
   const totalDebt = s.loans.reduce((t, l) => t + l.bal, 0)
   const totalPay = s.loans.reduce((t, l) => t + l.pay, 0)
-
-  // 투자 평가손익은 투자자산에 대해서만 계산
-  const profit = investmentBal - investmentPrin
+  const totalPmt = s.accs.reduce((t, a) => t + a.pmt, 0) + s.holdings.reduce((t, h) => t + h.pmt, 0) + s.cash.reduce((t, c) => t + c.pmt, 0)
+  const accStock = (i: number) => s.holdings.filter(h => h.acc === i).reduce((t, h) => t + hv(h), 0)
+  const pct = r.need > 0 ? (r.assetReal / r.need) * 100 : 0
+  const ok = r.gap <= 1
+  const isEmpty = totalBal === 0 && propTotal === 0 && s.monthly === 0
+  const wRet = wRetOf(s)
+  const wReal = ((1 + wRet / 100) / (1 + s.inflation / 100) - 1) * 100
 
   const byAcc = [...s.accs.map((a, i) => ({ label: a.name, value: a.bal + accStock(i) })), { label: '예·적금', value: cashTotal }, ...s.properties.map(p => ({ label: p.name || '부동산', value: p.value }))]
   const byItem = [
@@ -360,84 +85,100 @@ export default function App() {
     { label: '예·적금', value: cashTotal },
     ...s.properties.map(p => ({ label: p.name || '부동산', value: p.value })),
   ]
-  const stale = !!mc && mc.key !== JSON.stringify(s)
-  const runMC = () => {
-    setBusy(true)
-    const key = JSON.stringify(s)
-    setTimeout(() => { setMc({ ...monteCarlo(s), key }); setBusy(false) }, 30)
-  }
 
+  // ---- 백업 ----
   const exportJSON = () => {
-    const blob = new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'portfolio-sim-backup.json'; a.click(); URL.revokeObjectURL(url);
+    const url = URL.createObjectURL(new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' }))
+    const a = document.createElement('a'); a.href = url; a.download = 'cashflow-planner-backup.json'; a.click(); URL.revokeObjectURL(url)
   }
   const importJSON = async (file?: File) => {
-    if (!file) return;
-    try { const parsed = JSON.parse(await file.text()); if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.accs)) throw new Error('형식이 올바르지 않습니다.'); setS({ ...DEFAULT, ...parsed }); setMc(null); setImportError(''); } catch { setImportError('JSON 파일을 읽지 못했습니다. 이 시뮬레이터에서 내보낸 백업 파일인지 확인해 주세요.'); }
+    if (!file) return
+    try {
+      const parsed = JSON.parse(await file.text())
+      if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.accs)) throw new Error('형식 오류')
+      setS(sanitize(parsed)); setNote('백업을 불러왔습니다. 형식이 맞지 않는 값은 안전한 값으로 바꿔 불러옵니다.')
+    } catch { setNote('파일을 읽지 못했습니다. 이 앱에서 내보낸 JSON 백업 파일인지 확인해 주세요.') }
   }
-  const allocTotal = Math.max(1, s.stockPct + s.bondPct + s.cashPct)
-  const allocReturn = (s.stockPct * 7 + s.bondPct * 3.5 + s.cashPct * 2) / allocTotal
-  const scenarioSpend = (extraPmt: number, retireAge: number) => simulate({ ...s, accs: s.accs.map((a, i) => i === 1 ? { ...a, pmt: a.pmt + extraPmt } : a), retireAge }).gap
-  const extraNeeded = (() => { if (ok) return 0; let lo=0,hi=100000; while(hi<100000000 && scenarioSpend(hi,s.retireAge)>0) hi*=2; for(let i=0;i<28;i++){const mid=(lo+hi)/2;if(scenarioSpend(mid,s.retireAge)<=0)hi=mid;else lo=mid;} return Math.ceil(hi/10000)*10000 })()
-  const delayedAge = (() => { for(let a=Math.max(s.retireAge+1,s.age+1);a<=Math.min(85,s.endAge-1);a++){if(simulate({ ...s, retireAge:a }).gap<=0)return a;} return null })()
-  const reducedMonthly = (() => { let lo=0,hi=s.monthly; for(let i=0;i<24;i++){const mid=(lo+hi)/2;if(simulate({ ...s, monthly:mid }).gap<=0)lo=mid;else hi=mid;} return Math.floor(lo/10000)*10000 })()
+
+  const scnRows = [['기본', r], ['보수 (수익률 −1.5%p)', cons], ['위기 (보수 + 은퇴 직후 −25%)', crisis]] as const
 
   return (
     <div className="page">
       <header className="top">
-        <h1>캐시플로우 플래너</h1>
-        <p>
-          {s.retireAge}세부터 {s.endAge}세까지,
-          통장에 매달 세후 {won(s.monthly)}이 찍히려면
-        </p>
-        <p>
-          현재 자산과 투자 계획을 바탕으로
-          목표 달성에 필요한 방법을 시뮬레이션해 보세요.</p>
-        
+        <div className="top-row">
+          <h1>캐시플로우 플래너</h1>
+          <button className="btn-del" onClick={() => { if (window.confirm('입력한 값을 모두 지우고 처음 상태로 되돌릴까요?')) setS(DEFAULT) }}>처음 값으로 초기화</button>
+        </div>
+        <p>{s.retireAge}세부터 {s.endAge}세까지, 통장에 매달 세후 {won(s.monthly)}이 찍히려면</p>
+        <p className="privacy">입력한 값은 이 브라우저에만 저장되고 서버로 전송되지 않습니다.</p>
       </header>
 
-      <section className="card backup-tools">
-        <h2>백업 및 복원</h2>
-        <div className="tool-row"><button className="btn" onClick={exportJSON}>JSON 백업 다운로드</button><label className="btn file-btn">JSON 백업 불러오기<input type="file" accept="application/json,.json" onChange={e => importJSON(e.target.files?.[0])} /></label></div>
-        {importError && <p className="warn">{importError}</p>}<p className="hint">다른 기기에서 이 파일을 불러오면 금융자산·부동산·부채 입력값을 복원할 수 있습니다. 백업 파일에는 금융 정보가 포함될 수 있으니 안전하게 보관하세요.</p>
-      </section>
+      {(msgs.errors.length > 0 || msgs.warns.length > 0) && (
+        <div className="banners" role="alert">
+          {msgs.errors.map((m, i) => <p key={'e' + i} className="banner err">{m}</p>)}
+          {msgs.warns.map((m, i) => <p key={'w' + i} className="banner warnb">{m}</p>)}
+        </div>
+      )}
+
+      {isEmpty && (
+        <section className="card guide">
+          <h2>이렇게 시작해 보세요</h2>
+          <ol>
+            <li><b>나와 목표</b>에 현재 나이와 받고 싶은 월 금액을 입력합니다.</li>
+            <li><b>내 계좌·종목·예적금·부동산·부채</b>를 아는 만큼 입력합니다. 0원이어도 괜찮습니다.</li>
+            <li>오른쪽(모바일은 위쪽) <b>달성률</b>과 <b>위기 상황 점검</b>을 확인하고, 아래 시나리오로 보완해 보세요.</li>
+          </ol>
+        </section>
+      )}
+
       <div className="layout">
         <main className="inputs">
-          <section className="card">
-            <h2>나와 목표</h2>
+          <Card title="나와 목표">
             <div className="grid3">
-              <Num label="현재 나이" value={s.age} unit="세" onChange={v => set('age', v)} />
-              <Num label="인출 시작 나이" value={s.retireAge} unit="세" onChange={v => set('retireAge', v)} />
-              <Num label="인출 종료 나이" value={s.endAge} unit="세" onChange={v => set('endAge', v)} />
+              <Num label="현재 나이" value={s.age} unit="세" onChange={v => set('age', Math.round(v))} />
+              <Num label="인출 시작 나이" value={s.retireAge} unit="세" onChange={v => set('retireAge', Math.round(v))} />
+              <Num label="인출 종료 나이" value={s.endAge} unit="세" onChange={v => set('endAge', Math.round(v))} />
             </div>
             <div className="grid2" style={{ marginTop: 14 }}>
-              <Money label="월 목표 (세후)" value={s.monthly} onChange={v => set('monthly', v)} />
-              <Money label="끝까지 남길 원금" value={s.keep} onChange={v => set('keep', v)} />
+              <Money label="월 목표 (세후, 오늘 가치)" value={s.monthly} onChange={v => set('monthly', v)} />
+              <Money label="끝까지 남길 원금 (오늘 가치)" value={s.keep} onChange={v => set('keep', v)} />
             </div>
-          </section>
+          </Card>
 
-          <section className="card">
-            <h2>보수적 가정</h2>
-            <div className="grid2">
-              <Rng label="물가상승률" value={s.inflation} min={0} max={6} step={0.5} unit="%" onChange={v => set('inflation', v)} />
-              <Rng label="인출기 수익률" value={s.wRet} min={0} max={8} step={0.5} unit="%" onChange={v => set('wRet', v)} />
+          <Card title="물가와 인출기 자산 배분">
+            <Rng label="물가상승률" value={s.inflation} min={0} max={6} step={0.5} unit="%" onChange={v => set('inflation', v)} />
+            <p className="hint">인출 시작 이후 자산을 어떻게 굴릴지 정합니다. 인출기 수익률은 이 배분과 자산군별 기대수익률에서 계산되어, 필요 자산 계산에 그대로 쓰입니다.</p>
+            <div className="grid3" style={{ marginTop: 12 }}>
+              <Rng label="주식" value={s.stockPct} min={0} max={100} step={5} unit="%" onChange={v => set('stockPct', v)} />
+              <Rng label="채권" value={s.bondPct} min={0} max={100} step={5} unit="%" onChange={v => set('bondPct', v)} />
+              <Rng label="현금" value={s.cashPct} min={0} max={100} step={5} unit="%" onChange={v => set('cashPct', v)} />
             </div>
-            <p className="hint">적립기 수익률은 아래 계좌별로 입력합니다. 물가가 높고 수익률이 낮을수록 필요 자산이 커집니다.</p>
-          </section>
-
-          <section className="card">
-            <h2>자산 배분 시뮬레이션</h2>
-            <p className="hint">비중을 조절하면 인출기 확률 계산의 예상 변동성이 달라집니다. 비중은 자동으로 100% 정규화해 계산합니다.</p>
-            <div className="grid3">
-              <Rng label="주식" value={s.stockPct} min={0} max={100} step={5} unit="%" onChange={v => set('stockPct',v)} />
-              <Rng label="채권" value={s.bondPct} min={0} max={100} step={5} unit="%" onChange={v => set('bondPct',v)} />
-              <Rng label="현금" value={s.cashPct} min={0} max={100} step={5} unit="%" onChange={v => set('cashPct',v)} />
+            <div className="grid3" style={{ marginTop: 12 }}>
+              <Num label="주식 기대수익률" value={s.rStock} unit="%" step={0.5} onChange={v => set('rStock', v)} />
+              <Num label="채권 기대수익률" value={s.rBond} unit="%" step={0.5} onChange={v => set('rBond', v)} />
+              <Num label="현금 기대수익률" value={s.rCash} unit="%" step={0.5} onChange={v => set('rCash', v)} />
             </div>
-            <p className="sum-line">입력 비중 {s.stockPct+s.bondPct+s.cashPct}% · 가중 기대수익률 예시 <b>{allocReturn.toFixed(2)}%</b> · 예상 변동성 <b>{(Math.sqrt(Math.pow(s.stockPct/allocTotal*.20,2)+Math.pow(s.bondPct/allocTotal*.06,2)+Math.pow(s.cashPct/allocTotal*.01,2))*100).toFixed(1)}%</b></p>
-          </section>
+            <p className="sum-line">비중 합계 {s.stockPct + s.bondPct + s.cashPct}% (100%가 아니어도 비율로 환산) · 인출기 수익률 <b>{wRet.toFixed(2)}%</b> (물가 반영 실질 <b>{wReal.toFixed(2)}%</b>)</p>
+          </Card>
 
-          <section className="card">
-            <h2>내 계좌</h2>
+          <Card title="연금·기타 소득 (인출기)" open={s.incomes.length > 0}>
+            <p className="hint">국민연금·퇴직연금·개인연금처럼 은퇴 후 들어오는 월 소득을 <b>세후, 오늘 가치</b>로 입력하세요. 물가에 따라 오른다고 가정합니다. 시작 나이 전까지의 공백은 자산으로 메웁니다.</p>
+            {s.incomes.map(i => (
+              <div className="loan" key={i.id}>
+                <div className="loan-head">
+                  <input className="name-input" value={i.name} aria-label="소득 이름" onChange={e => upd('incomes', i.id, { name: e.target.value })} />
+                  <button className="btn-del" onClick={() => del('incomes', i.id)}>삭제</button>
+                </div>
+                <div className="grid2">
+                  <Num label="수령 시작 나이" value={i.startAge} unit="세" onChange={v => upd('incomes', i.id, { startAge: Math.round(v) })} />
+                  <Money label="월 수령액" value={i.monthly} onChange={v => upd('incomes', i.id, { monthly: v })} />
+                </div>
+              </div>
+            ))}
+            <button className="btn" onClick={() => add('incomes', { name: '국민연금', startAge: 65, monthly: 0 })}>+ 연금·소득 추가</button>
+          </Card>
+
+          <Card title="내 계좌">
             {s.accs.map((a, i) => (
               <div className="acc" key={a.name}>
                 <div className="acc-head"><strong>{a.name}</strong><span>{a.note}</span>{accStock(i) > 0 && <span className="stock">보유 종목 {won(accStock(i))} 별도</span>}</div>
@@ -445,15 +186,13 @@ export default function App() {
                   <Money label="평가금액 (종목 제외)" value={a.bal} onChange={v => setAcc(i, 'bal', v)} />
                   <Money label="투자원금 (종목 제외)" value={a.principal} onChange={v => setAcc(i, 'principal', v)} />
                   <Money label="월 납입" value={a.pmt} onChange={v => setAcc(i, 'pmt', v)} />
-                  <Num label="기대수익률" value={a.ret} unit="%" step={0.5} onChange={v => setAcc(i, 'ret', v)} />
-                  <Num label="변동성 (확률 계산용)" value={a.vol ?? DEF_VOL[i]} unit="%" step={0.5} onChange={v => setAcc(i, 'vol', v)} />
+                  <Num label="적립기 기대수익률" value={a.ret} unit="%" step={0.5} onChange={v => setAcc(i, 'ret', v)} />
                 </div>
               </div>
             ))}
-          </section>
+          </Card>
 
-          <section className="card">
-            <h2>세액공제 환급</h2>
+          <Card title="세액공제 환급" open={false}>
             <div className="grid2">
               <Money label="연 총급여" value={s.salary} onChange={v => set('salary', v)} />
               <label className="check">
@@ -461,36 +200,31 @@ export default function App() {
                 환급금을 연금저축에 재투자
               </label>
             </div>
-            <p className="sum-line">
-              연 환급 예상 <b>{won(r.credit.refund)}</b> 공제율 <b>{(r.credit.rate * 100).toFixed(1)}%</b> 공제 대상 납입 <b>{won(r.credit.base)}</b>
-            </p>
-            {r.credit.room > 0 && (
-              <p className="hint">공제 한도까지 연 {won(r.credit.room)} 여유가 있습니다. 한도는 연금저축 {fmt(TAX.creditPension)}, IRP 포함 {fmt(TAX.creditTotal)}입니다.</p>
-            )}
-          </section>
+            <p className="sum-line">연 환급 예상 <b>{won(r.credit.refund)}</b> 공제율 <b>{(r.credit.rate * 100).toFixed(1)}%</b> 공제 대상 납입 <b>{won(r.credit.base)}</b></p>
+            {r.credit.room > 0 && <p className="hint">공제 한도까지 연 {won(r.credit.room)} 여유가 있습니다. 한도는 연금저축 {fmt(TAX.creditPension)}, IRP 포함 {fmt(TAX.creditTotal)}입니다.</p>}
+          </Card>
 
-          <section className="card">
-            <h2>보유 종목</h2>
+          <Card title="보유 종목" open={s.holdings.length > 0}>
             {s.holdings.length === 0 && <p className="empty">주식·ETF를 계좌별로 기록해 보세요. 원화 환산 가격으로 입력합니다.</p>}
             {s.holdings.map(h => {
               const diff = hv(h) - hp(h)
               return (
                 <div className="loan" key={h.id}>
                   <div className="loan-head">
-                    <input className="name-input" value={h.name} aria-label="종목명" onChange={e => setHolding(h.id, 'name', e.target.value)} />
-                    <select className="sel" value={h.acc} aria-label="보유 계좌" onChange={e => setHolding(h.id, 'acc', Number(e.target.value))}>
+                    <input className="name-input" value={h.name} aria-label="종목명" onChange={e => upd('holdings', h.id, { name: e.target.value })} />
+                    <select className="sel" value={h.acc} aria-label="보유 계좌" onChange={e => upd('holdings', h.id, { acc: Number(e.target.value) })}>
                       {s.accs.map((a, i) => <option key={a.name} value={i}>{a.name}</option>)}
                     </select>
-                    <button className="btn-del" onClick={() => delHolding(h.id)}>삭제</button>
+                    <button className="btn-del" onClick={() => del('holdings', h.id)}>삭제</button>
                   </div>
                   <div className="grid3">
-                    <Num label="수량" value={h.qty} unit="주" onChange={v => setHolding(h.id, 'qty', v)} />
-                    <Money label="평균 매입가" value={h.avg} onChange={v => setHolding(h.id, 'avg', v)} />
-                    <Money label="현재가" value={h.price} onChange={v => setHolding(h.id, 'price', v)} />
+                    <Num label="수량" value={h.qty} unit="주" onChange={v => upd('holdings', h.id, { qty: Math.max(0, v) })} />
+                    <Money label="평균 매입가" value={h.avg} onChange={v => upd('holdings', h.id, { avg: v })} />
+                    <Money label="현재가" value={h.price} onChange={v => upd('holdings', h.id, { price: v })} />
                   </div>
                   <div className="grid2" style={{ marginTop: 10 }}>
-                    <Num label="기대수익률" value={h.ret ?? s.accs[h.acc].ret} unit="%" step={0.5} onChange={v => setHolding(h.id, 'ret', v)} />
-                    <Num label="변동성 (확률 계산용)" value={h.vol ?? 18} unit="%" step={0.5} onChange={v => setHolding(h.id, 'vol', v)} />
+                    <Num label="적립기 기대수익률" value={h.ret} unit="%" step={0.5} onChange={v => upd('holdings', h.id, { ret: v })} />
+                    <Money label="월 매수액" value={h.pmt} onChange={v => upd('holdings', h.id, { pmt: v })} />
                   </div>
                   <p className="sum-line">
                     평가금액 <b>{won(hv(h))}</b> 평가손익{' '}
@@ -499,71 +233,83 @@ export default function App() {
                 </div>
               )
             })}
-            <button className="btn" onClick={addHolding}>+ 종목 추가</button>
-            <p className="hint">종목은 선택한 계좌의 잔액에 더해지고, 종목마다 자기 기대수익률로 계산됩니다. 변동성은 주식형 15~25%, 채권형 3~8% 정도가 일반적입니다. 해외 종목은 원화로 환산한 가격을 입력하세요.</p>
-          </section>
+            <button className="btn" onClick={() => add('holdings', { name: `종목 ${s.holdings.length + 1}`, acc: 4, qty: 0, avg: 0, price: 0, ret: 6, pmt: 0 })}>+ 종목 추가</button>
+            <p className="hint">종목은 선택한 계좌의 잔액에 더해지고 자기 기대수익률로 계산됩니다. 해외 종목은 원화로 환산한 가격을 입력하세요.</p>
+          </Card>
 
-          <section className="card">
-            <h2>현금성 자산 (예금·적금)</h2>
+          <Card title="현금성 자산 (예금·적금)" open={s.cash.length > 0}>
             {s.cash.length === 0 && <p className="empty">예금, 적금, 파킹통장 같은 현금성 자산을 추가하세요.</p>}
             {s.cash.map(c => (
               <div className="loan" key={c.id}>
                 <div className="loan-head">
-                  <input className="name-input" value={c.name} aria-label="상품명" onChange={e => setCash(c.id, 'name', e.target.value)} />
-                  <button className="btn-del" onClick={() => delCash(c.id)}>삭제</button>
+                  <input className="name-input" value={c.name} aria-label="상품명" onChange={e => upd('cash', c.id, { name: e.target.value })} />
+                  <button className="btn-del" onClick={() => del('cash', c.id)}>삭제</button>
                 </div>
                 <div className="grid3">
-                  <Money label="현재 잔액" value={c.bal} onChange={v => setCash(c.id, 'bal', v)} />
-                  <Money label="월 납입 (적금)" value={c.pmt} onChange={v => setCash(c.id, 'pmt', v)} />
-                  <Num label="이자율 (연)" value={c.rate} unit="%" step={0.1} onChange={v => setCash(c.id, 'rate', v)} />
+                  <Money label="현재 잔액" value={c.bal} onChange={v => upd('cash', c.id, { bal: v })} />
+                  <Money label="월 납입 (적금)" value={c.pmt} onChange={v => upd('cash', c.id, { pmt: v })} />
+                  <Num label="이자율 (연)" value={c.rate} unit="%" step={0.1} onChange={v => upd('cash', c.id, { rate: v })} />
                 </div>
               </div>
             ))}
-            <button className="btn" onClick={addCash}>+ 예·적금 추가</button>
+            <button className="btn" onClick={() => add('cash', { name: `예·적금 ${s.cash.length + 1}`, bal: 0, pmt: 0, rate: 3 })}>+ 예·적금 추가</button>
             <p className="hint">이자에는 15.4%를 과세한다고 가정하고, 만기가 되면 같은 조건으로 계속 굴린다고 봅니다.</p>
-          </section>
+          </Card>
 
-          <section className="card">
-            <h2>부동산 자산 (현금흐름 시뮬레이션 제외)</h2>
-            <p className="hint">거주 주택이나 투자용 부동산의 현재 시세를 입력하세요. 총자산·순자산과 자산 비중에는 포함되지만, 매도·주택연금·임대수익을 별도로 설정하지 않는 한 현금흐름 충당 자산에는 포함하지 않습니다. 부동산 관련 대출은 아래 부채에 별도로 등록하세요.</p>
-            {s.properties.length === 0 && <p className="empty">등록된 부동산이 없습니다.</p>}
+          <Card title="부동산" open={s.properties.length > 0}>
+            <p className="hint">기본적으로 은퇴 생활비 계산에는 넣지 않습니다. <b>은퇴 시점에 판다</b>고 표시하면 비용·세금을 뺀 금액이 금융자산에 더해지고, 팔지 않는 부동산의 <b>월 임대수익</b>(세후, 오늘 가치)은 인출기 소득으로 반영됩니다. 가격은 물가와 같은 속도로 오른다고(실질 변동 0%) 가정합니다.</p>
+            {s.properties.length > 0 && (
+              <div style={{ maxWidth: 220, marginTop: 8 }}>
+                <Num label="매도 시 비용·세금" value={s.saleCost} unit="%" step={0.5} onChange={v => set('saleCost', Math.max(0, v))} />
+              </div>
+            )}
             {s.properties.map(p => (
               <div className="loan" key={p.id}>
                 <div className="loan-head">
-                  <input className="name-input" value={p.name} aria-label="부동산 이름" onChange={e => setProperty(p.id, 'name', e.target.value)} />
-                  <button className="btn-del" onClick={() => delProperty(p.id)}>삭제</button>
+                  <input className="name-input" value={p.name} aria-label="부동산 이름" onChange={e => upd('properties', p.id, { name: e.target.value })} />
+                  <button className="btn-del" onClick={() => del('properties', p.id)}>삭제</button>
                 </div>
                 <div className="grid2">
-                  <Money label="현재 시세" value={p.value} onChange={v => setProperty(p.id, 'value', v)} />
-                  <label className="field"><span>용도 / 메모</span><input value={p.note} onChange={e => setProperty(p.id, 'note', e.target.value)} /></label>
+                  <Money label="현재 시세" value={p.value} onChange={v => upd('properties', p.id, { value: v })} />
+                  <Money label="월 임대수익 (세후)" value={p.rent} onChange={v => upd('properties', p.id, { rent: v })} />
+                </div>
+                <div className="grid2" style={{ marginTop: 6 }}>
+                  <label className="field"><span>용도 / 메모</span><input className="plain" value={p.note} onChange={e => upd('properties', p.id, { note: e.target.value })} /></label>
+                  <label className="check"><input type="checkbox" checked={p.sell} onChange={e => upd('properties', p.id, { sell: e.target.checked })} />은퇴 시점에 판다</label>
                 </div>
               </div>
             ))}
-            <button className="btn" onClick={addProperty}>+ 부동산 추가</button>
-          </section>
+            <button className="btn" onClick={() => add('properties', { name: `부동산 ${s.properties.length + 1}`, value: 0, note: '', rent: 0, sell: false })}>+ 부동산 추가</button>
+          </Card>
 
-          <section className="card">
-            <h2>부채</h2>
+          <Card title="부채" open={s.loans.length > 0}>
             {s.loans.length === 0 && <p className="empty">등록된 대출이 없습니다. 대출이 있다면 종류별로 추가하세요.</p>}
             {s.loans.map(l => (
               <div className="loan" key={l.id}>
                 <div className="loan-head">
-                  <input className="name-input" value={l.name} aria-label="대출 이름" onChange={e => setLoan(l.id, 'name', e.target.value)} />
-                  <button className="btn-del" onClick={() => delLoan(l.id)}>삭제</button>
+                  <input className="name-input" value={l.name} aria-label="대출 이름" onChange={e => upd('loans', l.id, { name: e.target.value })} />
+                  <button className="btn-del" onClick={() => del('loans', l.id)}>삭제</button>
                 </div>
                 <div className="grid3">
-                  <Money label="대출 잔액" value={l.bal} onChange={v => setLoan(l.id, 'bal', v)} />
-                  <Num label="금리 (연)" value={l.rate} unit="%" step={0.1} onChange={v => setLoan(l.id, 'rate', v)} />
-                  <Money label="월 상환액" value={l.pay} onChange={v => setLoan(l.id, 'pay', v)} />
+                  <Money label="대출 잔액" value={l.bal} onChange={v => upd('loans', l.id, { bal: v })} />
+                  <Num label="금리 (연)" value={l.rate} unit="%" step={0.1} onChange={v => upd('loans', l.id, { rate: v })} />
+                  <Money label="월 상환액" value={l.pay} onChange={v => upd('loans', l.id, { pay: v })} />
                 </div>
-                {l.bal > 0 && l.pay < (l.bal * l.rate) / 1200 && (
-                  <p className="warn">월 상환액이 월 이자(약 {won((l.bal * l.rate) / 1200)})보다 적어 잔액이 계속 늘어납니다.</p>
-                )}
+                {l.bal > 0 && l.pay < (l.bal * l.rate) / 1200 && <p className="warn">월 상환액이 월 이자(약 {won((l.bal * l.rate) / 1200)})보다 적어 잔액이 계속 늘어납니다.</p>}
               </div>
             ))}
-            <button className="btn" onClick={addLoan}>+ 대출 추가</button>
-            <p className="hint">월 상환액은 위 납입액과 별개로 나가는 돈입니다. 인출 시작 시점에 남은 대출은 자산에서 차감합니다.</p>
-          </section>
+            <button className="btn" onClick={() => add('loans', { name: `대출 ${s.loans.length + 1}`, bal: 0, rate: 4.5, pay: 0 })}>+ 대출 추가</button>
+            <p className="hint">월 상환액은 위 납입액과 별개로 나가는 돈이며, 인출 시작 시점에 남은 대출은 자산에서 차감합니다.</p>
+          </Card>
+
+          <Card title="백업 및 복원" open={false}>
+            <div className="tool-row">
+              <button className="btn" onClick={exportJSON}>JSON 백업 다운로드</button>
+              <label className="btn file-btn">JSON 백업 불러오기<input type="file" accept="application/json,.json" onChange={e => { importJSON(e.target.files?.[0]); e.target.value = '' }} /></label>
+            </div>
+            {note && <p className="warn">{note}</p>}
+            <p className="hint">다른 기기에서 이 파일을 불러오면 입력값을 복원할 수 있습니다. 금융 정보가 들어 있으니 안전하게 보관하세요.</p>
+          </Card>
         </main>
 
         <aside className="result">
@@ -571,142 +317,130 @@ export default function App() {
             <p className="hero-sub">{s.retireAge}세 시점 달성률</p>
             <p className="hero-num">{pct.toFixed(0)}%</p>
             <div className="bar"><i style={{ width: `${Math.min(100, pct)}%` }} /></div>
-            <p className="hero-msg">
-              {ok ? `목표를 ${fmt(-r.gap)} 넘게 모을 수 있어요.` : `오늘 가치로 ${fmt(r.gap)}이 부족해요.`}
-            </p>
+            <p className="hero-msg">{isEmpty ? '입력하면 여기에 결과가 나옵니다.' : ok ? `목표를 ${fmt(-r.gap)} 넘게 모을 수 있어요.` : `오늘 가치로 ${fmt(r.gap)}이 부족해요.`}</p>
+            {!isEmpty && <p className="hero-sub" style={{ marginTop: 6 }}>{r.wd.dep !== null ? `기본 가정에서 ${r.wd.dep.toFixed(1)}세에 자산이 바닥납니다.` : `기본 가정에서 ${s.endAge}세까지 유지됩니다.`}</p>}
           </section>
 
-          {!ok && r.extra > 0 && (
-            <section className="card note">
-              월 <b>{won(Math.ceil(r.extra))}</b>을 ISA에 더 넣으면 메울 수 있어요.
-              <small>ISA 수익률 기준의 단순 계산입니다.</small>
-            </section>
-          )}
+          <Card title="위기 상황 점검">
+            <table className="scn">
+              <thead><tr><th>시나리오</th><th>{s.retireAge}세 자산</th><th>결과</th></tr></thead>
+              <tbody>
+                {scnRows.map(([label, x]) => (
+                  <tr key={label}>
+                    <td>{label}</td>
+                    <td>{fmt(x.assetReal)}</td>
+                    <td className={x.wd.ok ? 'okc' : 'badc'}>{x.wd.dep !== null ? `${x.wd.dep.toFixed(1)}세 고갈` : x.wd.ok ? `${s.endAge}세에 ${fmt(x.wd.end)}` : `남길 원금 ${fmt(s.keep - x.wd.end)} 부족`}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="hint">확률이 아니라 가정을 나쁘게 바꿔 본 점검입니다. 모든 금액은 오늘 가치이고, 수익률을 낮추거나 은퇴 직후 시장이 급락해도 버티는지를 봅니다.</p>
+          </Card>
 
-          <section className="card">
-            <h2>목표 부족 해결 시나리오</h2>
-            {ok ? <p className="sum-line">현재 입력 기준으로 목표 자산을 충족합니다. 납입액이나 배분을 바꿔 여유도를 확인해 보세요.</p> : <div className="scenario-list">
-              <div><span>① 월 납입액 늘리기</span><b>월 {won(extraNeeded)} 추가</b><small>현재 ISA 월 납입액에 추가하는 금액으로 계산한 근사치입니다.</small></div>
-              <div><span>② 인출 시작 늦추기</span><b>{delayedAge === null ? '목표 달성 불가' : `${delayedAge}세부터 인출`}</b><small>{delayedAge === null ? '현재 종료 나이까지 연기해도 부족할 수 있습니다.' : `현재보다 ${delayedAge-s.retireAge}년 늦춥니다.`}</small></div>
-              <div><span>③ 월 목표 생활비 줄이기</span><b>월 {won(reducedMonthly)} 이하</b><small>오늘 가치 기준 월 인출 목표의 근사치입니다.</small></div>
-            </div>}
-          </section>
-
-          <section className="card">
-            <h2>성공 확률 (몬테카를로)</h2>
-            <p className="hint" style={{ marginTop: 0 }}>적립기와 인출기 모두 시장 변동을 반영한 1,000개 경로를 계산합니다. 인출 기간 동안 자산이 고갈되지 않고 목표 잔존금액을 지키는 비율입니다.</p>
-            {mc && (
-              <>
-                <p className={`mc-num ${mc.rate >= 0.8 ? 'good' : mc.rate >= 0.5 ? 'mid' : 'low'}`}>{(mc.rate * 100).toFixed(0)}%</p>
-                <dl className="stats">
-                  <div><dt>은퇴 시 자산 (하위 10%)</dt><dd>{fmt(mc.p10)}</dd></div>
-                  <div><dt>은퇴 시 자산 (중앙값)</dt><dd>{fmt(mc.p50)}</dd></div>
-                  <div><dt>은퇴 시 자산 (상위 10%)</dt><dd>{fmt(mc.p90)}</dd></div>
-                </dl>
-                <small className="hint">성공 확률은 인출기 변동까지 반영합니다. 자산 범위와 아래 차트는 은퇴 전 적립기의 결과이며, 모두 오늘 가치 기준입니다.</small>
-                {stale && <p className="warn">입력이 바뀌었습니다. 다시 돌려야 최신 결과가 나옵니다.</p>}
-              </>
-            )}
-            <button className="btn" style={{ marginTop: 12 }} onClick={runMC} disabled={busy}>{busy ? '계산 중…' : mc ? '다시 돌리기' : '1,000번 돌려보기'}</button>
-          </section>
-
-          <section className="card">
-            <h2>{s.retireAge}세에 필요한 자산 vs 예상 자산</h2>
-            <Chart pts={r.series} need={r.need} fan={mc?.fan} />
-            <small className="hint">선은 부동산을 제외한 금융자산에서 등록된 부채를 차감한 금액을 오늘 가치로 환산한 값입니다. 부동산 시세는 은퇴 생활비 시뮬레이션에 포함하지 않습니다.</small>
+          <Card title={`${s.age}세 ~ ${s.endAge}세 자산 경로`}>
+            <LifeChart acc={r.series} wd={r.wd.path} alt={crisis.wd.path} need={r.need} />
+            <div className="legend-text"><span><i className="sw base" /> 기본</span><span><i className="sw alt" /> 위기 시나리오</span></div>
             <dl className="stats">
               <div><dt>필요 자산 (오늘 가치)</dt><dd>{fmt(r.need)}</dd></div>
               <div><dt>예상 자산 (오늘 가치)</dt><dd>{fmt(r.assetReal)}</dd></div>
+              {r.saleReal > 0 && <div><dt>└ 부동산 매도 반영</dt><dd>{fmt(r.saleReal)}</dd></div>}
               <div><dt>예상 자산 (미래 금액)</dt><dd>{fmt(r.assetNom)}</dd></div>
+              {r.first !== null && r.first > s.retireAge && <div><dt>연금 시작 전({s.retireAge}~{r.first}세) 필요 자산</dt><dd>{fmt(r.bridge)}</dd></div>}
               <div><dt>인출 시점 남은 대출</dt><dd>{fmt(r.debtLeft)}</dd></div>
             </dl>
-          </section>
+            <small className="hint">인출 시작 시점의 점프는 부동산 매도 반영과 인출기 가정 때문입니다. 대출은 차감되어 있습니다.</small>
+          </Card>
 
-          <section className="card">
-            <h2>인출기 자산 고갈 경로</h2>
-            {mc && <p className="sum-line">예상 자산 고갈 시점: <b>{mc.depletionAge === null ? '시뮬레이션 경로에서 고갈 없음' : `${mc.depletionAge.toFixed(1)}세 전후`}</b></p>}
-            <WithdrawalChart rows={mc?.withdrawalFan ?? []} />
-            {mc && <div className="legend-text"><span>위쪽 선: 상위 10%</span><span>가운데 선: 중앙값</span><span>아래쪽 선: 하위 10%</span></div>}
-            <p className="hint">인출기 경로는 현재 가정과 단순화된 월별 무작위 수익률에 따른 예시이며 미래를 예측하거나 보장하지 않습니다.</p>
-          </section>
-
-          <section className="card">
-            <h2>자산 비중</h2>
+          <Card title="자산 비중" open={false}>
             <div className="tabs" role="tablist">
               <button role="tab" aria-selected={view === 'acc'} className={view === 'acc' ? 'on' : ''} onClick={() => setView('acc')}>계좌별</button>
               <button role="tab" aria-selected={view === 'item'} className={view === 'item' ? 'on' : ''} onClick={() => setView('item')}>종목별</button>
             </div>
             <Donut data={view === 'acc' ? byAcc : byItem} />
-          </section>
+          </Card>
 
-          <section className="card">
-            <h2>현재 현황</h2>
+          <Card title="현재 현황" open={false}>
             <dl className="stats">
-              <div>
-                <dt>총 금융자산 (투자자산 + 현금성 자산)</dt>
-                <dd>{won(totalBal)}</dd>
-              </div>
-              <div>
-                <dt>부동산 자산 (현재 시세)</dt>
-                <dd>{won(propertyTotal)}</dd>
-              </div>
-              <div>
-                <dt>총자산 (금융자산 + 부동산)</dt>
-                <dd>{won(grossAssets)}</dd>
-              </div>
-              <div>
-                <dt>투자자산 평가금액 (예·적금 제외)</dt>
-                <dd>{won(investmentBal)}</dd>
-              </div>
-              <div>
-                <dt>투자원금 (예·적금 제외)</dt>
-                <dd>{won(investmentPrin)}</dd>
-              </div>
-              <div>
-                <dt>보유 종목 평가금액</dt>
-                <dd>{won(stockVal)}</dd>
-              </div>
-              <div>
-                <dt>현금성 자산 (예금·적금)</dt>
-                <dd>{won(cashTotal)}</dd>
-              </div>
-              <div>
-                <dt>투자 평가손익</dt>
-                <dd className={profit >= 0 ? 'up' : 'down'}>
-                  {profit >= 0 ? '+' : ''}{won(profit)}
-                </dd>
-              </div>
-              <div>
-                <dt>총부채 ({s.loans.length}건)</dt>
-                <dd>{won(totalDebt)}</dd>
-              </div>
-              <div>
-                <dt>순자산 (총자산 - 총부채)</dt>
-                <dd>{won(grossAssets - totalDebt)}</dd>
-              </div>
-              <div>
-                <dt>금융자산 기준 잔액 (금융자산 - 총부채)</dt>
-                <dd>{won(totalBal - totalDebt)}</dd>
-              </div>
-              <div>
-                <dt>월 총 납입</dt>
-                <dd>{won(totalPmt)}</dd>
-              </div>
-              <div>
-                <dt>월 총 상환</dt>
-                <dd>{won(totalPay)}</dd>
-              </div>
-              <div>
-                <dt>연 세액공제 환급 예상</dt>
-                <dd>{won(r.credit.refund)}</dd>
-              </div>
+              <div><dt>금융자산 (투자 + 현금성)</dt><dd>{won(totalBal)}</dd></div>
+              <div><dt>부동산 (현재 시세)</dt><dd>{won(propTotal)}</dd></div>
+              <div><dt>총자산</dt><dd>{won(totalBal + propTotal)}</dd></div>
+              <div><dt>총부채 ({s.loans.length}건)</dt><dd>{won(totalDebt)}</dd></div>
+              <div><dt>순자산</dt><dd>{won(totalBal + propTotal - totalDebt)}</dd></div>
+              <div><dt>투자자산 평가손익</dt><dd className={investBal - investPrin >= 0 ? 'up' : 'down'}>{investBal - investPrin >= 0 ? '+' : ''}{won(investBal - investPrin)}</dd></div>
+              <div><dt>월 총 납입</dt><dd>{won(totalPmt)}</dd></div>
+              <div><dt>월 총 상환</dt><dd>{won(totalPay)}</dd></div>
+              <div><dt>연 세액공제 환급 예상</dt><dd>{won(r.credit.refund)}</dd></div>
             </dl>
-          </section>
+          </Card>
         </aside>
       </div>
 
+      <div className="analysis">
+        <Card title="부족할 때 해결 시나리오">
+          {!sol ? (
+            <p className="empty">{isEmpty ? '입력하면 해결 시나리오가 계산됩니다.' : '지금 설정으로 이미 목표를 채웁니다. 목표를 높여 보거나 옆에서 조정 효과를 확인해 보세요.'}</p>
+          ) : (
+            <>
+              <ul className="sol">
+                {sol.map(x => (
+                  <li key={x.label} className={x.scn ? '' : 'na'}>
+                    <b>{x.label}</b>
+                    <span>{x.desc}</span>
+                    {x.robust !== null && <em className={x.robust ? 'okc' : 'badc'}>{x.robust ? '위기에도 유지' : '위기엔 부족'}</em>}
+                  </li>
+                ))}
+              </ul>
+              <p className="hint">각 값은 목표를 딱 맞추는 최소치입니다. 오른쪽 표시는 그 해결책을 적용했을 때 위 &quot;위기&quot; 가정에서도 {s.endAge}세까지 유지되는지입니다. 여유를 두려면 조금 더 넉넉하게 잡으세요.</p>
+            </>
+          )}
+        </Card>
+
+        <Card title="포트폴리오 조정 시뮬레이션">
+          <Money label="늘려 볼 월 금액" value={step} onChange={setStep} />
+          <p className="hint">월 {won(step)}을 한 곳에 더 넣을 때 {s.retireAge}세 예상 자산이 얼마나 늘어나는지 비교합니다 (오늘 가치). 납입 한도 초과는 위쪽 경고로 알려 드립니다.</p>
+          <ul className="rank">
+            {rank.map((x, i) => (
+              <li key={i}>
+                <span>{x.label}</span>
+                <i style={{ width: `${Math.max(2, (x.d / maxD) * 100)}%` }} />
+                <b>+{fmt(x.d)}</b>
+                <em>{x.p.toFixed(1)}%p</em>
+              </li>
+            ))}
+          </ul>
+
+          <h3 className="sub">종목 사이 비중 옮기기</h3>
+          {s.holdings.length < 2 ? (
+            <p className="empty">보유 종목을 2개 이상 추가하면 비중을 옮겨 볼 수 있어요.</p>
+          ) : (
+            <>
+              <div className="grid3">
+                <label className="field"><span>줄일 종목</span>
+                  <select className="sel" value={fromId} onChange={e => setMv({ ...mv, from: Number(e.target.value) })}>
+                    {s.holdings.map(h => <option key={h.id} value={h.id}>{h.name || '종목'}</option>)}
+                  </select>
+                </label>
+                <label className="field"><span>늘릴 종목</span>
+                  <select className="sel" value={toId} onChange={e => setMv({ ...mv, to: Number(e.target.value) })}>
+                    {s.holdings.map(h => <option key={h.id} value={h.id}>{h.name || '종목'}</option>)}
+                  </select>
+                </label>
+                <Money label="옮길 금액" value={mv.amt} onChange={v => setMv({ ...mv, amt: v })} />
+              </div>
+              <dl className="stats">
+                <div><dt>{s.retireAge}세 예상 자산 (오늘 가치)</dt><dd>{fmt(r.assetReal)} → {fmt(rMove.assetReal)}</dd></div>
+                <div><dt>달성률</dt><dd>{pct.toFixed(0)}% → {(r.need > 0 ? (rMove.assetReal / r.need) * 100 : 0).toFixed(0)}%</dd></div>
+              </dl>
+              <p className="hint">종목을 팔 때의 세금은 반영하지 않았고, 서로 다른 계좌의 종목끼리는 현실에서 바로 옮길 수 없다는 점에 유의하세요.</p>
+            </>
+          )}
+        </Card>
+      </div>
+
+      <div className="mini" aria-live="polite"><b>{pct.toFixed(0)}%</b><span>{isEmpty ? '입력해 보세요' : ok ? '목표 달성' : `${fmt(r.gap)} 부족`}</span></div>
+
       <footer>
-        참고용 시뮬레이션이며 투자 권유가 아닙니다. 세금은 단순화했습니다: CMA·일반 계좌 수익 15.4%, ISA 만기 비과세 {won(TAX.isaExempt)} 초과분 9.9%, IRP·연금저축 수령 5.5%. 세법은 바뀔 수 있으니 실제 적용 전에 확인하세요.
+        참고용 계산이며 투자 권유가 아닙니다. 세금은 단순화했습니다: CMA·일반 계좌 수익 15.4%, ISA 만기 비과세 {won(TAX.isaExempt)} 초과분 9.9%, IRP·연금저축 수령 5.5%. 인출 순서에 따른 세금 차이, 연금 수령액이 클 때의 종합과세, 종목별 세금 구분은 반영하지 않았습니다. 세법과 한도는 바뀔 수 있으니 실제 적용 전에 확인하세요.
       </footer>
     </div>
   )
